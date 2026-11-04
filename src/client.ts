@@ -1,38 +1,63 @@
-import { ScrapeAPI } from './api/unlocker/scrape';
-import { SearchAPI } from './api/unlocker/search';
-import { ZonesAPI } from './api/zones';
-import { Router as DatasetsRouter } from './api/datasets/router';
-import { setup as setupLogger, getLogger } from './utils/logger';
+import { ScrapeAPI } from './api/unlocker/scrape.js';
+import { ZonesAPI } from './api/zones.js';
+import { ScrapeRouter } from './api/scrape/router.js';
+import { SearchRouter } from './api/search/router.js';
+import { DatasetsClient } from './api/datasets/client.js';
+import { DiscoverService } from './api/discover/service.js';
+import type { DiscoverResult } from './api/discover/result.js';
+import type { DiscoverJob } from './api/discover/job.js';
+import type { DiscoverOptions } from './schemas/discover.js';
+import { ScraperStudioService } from './api/scraperstudio/service.js';
+import { BrowserService } from './api/browser/service.js';
+import { CrawlerService } from './api/crawler/service.js';
+import { SnapshotAPI } from './api/scrape/snapshot.js';
+import { setup as setupLogger, getLogger } from './utils/logger.js';
 import {
     DEFAULT_WEB_UNLOCKER_ZONE,
     DEFAULT_SERP_ZONE,
-} from './utils/constants';
-import { ValidationError } from './utils/errors';
-import { maskKey } from './utils/misc';
-import { writeContent, stringifyResults, getFilename } from './utils/files';
-import { assertSchema } from './schemas/utils';
-import { ScrapeOptionsSchema, SearchOptionsSchema } from './schemas/request';
+} from './utils/constants.js';
+import { ValidationError, AuthenticationError } from './utils/errors.js';
+import { readCliCredentials, type AuthSource } from './utils/cli-credentials.js';
+import { maskKey } from './utils/misc.js';
+import { writeContent, stringifyResults, getFilename } from './utils/files.js';
+import { assertSchema } from './schemas/utils.js';
+import { ScrapeOptionsSchema } from './schemas/request.js';
 import {
     URLParamSchema,
-    SearchQueryParamSchema,
     ApiKeySchema,
     VerboseSchema,
     ClientOptionsSchema,
-} from './schemas/client';
-import { SaveOptionsSchema } from './schemas/misc';
-import type { BdClientOptions, SaveOptions } from './types/client';
-import type { ZoneInfo } from './types/zones';
+} from './schemas/client.js';
+import { SaveOptionsSchema } from './schemas/misc.js';
+import { Transport } from './core/transport.js';
+import type { BdClientOptions, SaveOptions } from './types/client.js';
+import type { ZoneInfo } from './types/zones.js';
 import type {
     ScrapeJSONOptions,
-    SearchJSONOptions,
     SingleJSONResponse,
     BatchJSONResponse,
     ScrapeOptions,
-    SearchOptions,
     SingleRawResponse,
     BatchRawResponse,
     AnyResponse,
-} from './types/request';
+} from './types/request.js';
+
+function defineLazy<T>(obj: object, key: string, factory: () => T): void {
+    Object.defineProperty(obj, key, {
+        get() {
+            const value = factory();
+            Object.defineProperty(obj, key, {
+                value,
+                writable: false,
+                configurable: true,
+                enumerable: true,
+            });
+            return value;
+        },
+        configurable: true,
+        enumerable: true,
+    });
+}
 
 /**
  * Create a new bdclient instance
@@ -55,16 +80,25 @@ import type {
  * });
  *
  * // Using environment variables
- * process.env.BRIGHTDATA_API_KEY = 'your-key';
+ * process.env.BRIGHTDATA_API_TOKEN = 'your-key';
  * const client = new bdclient(); // Automatically uses env var
  * ```
  */
 export class bdclient {
-    private scrapeAPI: ScrapeAPI;
-    private searchAPI: SearchAPI;
+    private _scrapeAPI: ScrapeAPI | null = null;
+    private _discoverService: DiscoverService | null = null;
     private zonesAPI: ZonesAPI;
+    private transport: Transport;
+    private autoCreateZones: boolean;
+    private webUnlockerZone: string;
+    private serpZone: string;
     private logger!: ReturnType<typeof getLogger>;
-    datasets: DatasetsRouter;
+    declare scrape: ScrapeRouter;
+    declare search: SearchRouter;
+    declare datasets: DatasetsClient;
+    declare scraperStudio: ScraperStudioService;
+    declare browser: BrowserService;
+    declare crawler: CrawlerService;
 
     constructor(options?: BdClientOptions) {
         const opt = assertSchema(
@@ -73,6 +107,7 @@ export class bdclient {
             'bdclient.options',
         );
         const {
+            BRIGHTDATA_API_TOKEN,
             BRIGHTDATA_API_KEY,
             BRIGHTDATA_VERBOSE,
             BRIGHTDATA_WEB_UNLOCKER_ZONE,
@@ -91,33 +126,131 @@ export class bdclient {
         setupLogger(opt.logLevel, opt.structuredLogging, isVerbose);
         this.logger.info('initializing Bright Data SDK client');
 
+        // Resolve the API token by precedence: param → env → CLI store → error,
+        // recording how it was obtained (authSource) for the User-Agent.
+        let resolved: string | undefined;
+        let authSource: AuthSource;
+        if (opt.apiKey) {
+            resolved = opt.apiKey.trim();
+            authSource = 'param';
+        } else if (BRIGHTDATA_API_TOKEN || BRIGHTDATA_API_KEY) {
+            // `||` (not `??`): an empty BRIGHTDATA_API_TOKEN falls through to KEY.
+            resolved = (BRIGHTDATA_API_TOKEN || BRIGHTDATA_API_KEY)!.trim();
+            authSource = 'env';
+        } else {
+            const cliKey = readCliCredentials();
+            if (cliKey) {
+                resolved = cliKey;
+                authSource = 'cli_credentials';
+            } else {
+                throw new AuthenticationError(
+                    'No API token found. Run `npx @brightdata/cli login` or set ' +
+                        'BRIGHTDATA_API_TOKEN. Get a token at ' +
+                        'https://brightdata.com/cp/api_tokens',
+                );
+            }
+        }
         const apiKey = assertSchema(
             ApiKeySchema,
-            opt.apiKey || BRIGHTDATA_API_KEY,
+            resolved,
             'bdclient.options.apiKey',
         );
 
         this.logger.info(`API key validated successfully: ${maskKey(apiKey)}`);
         this.logger.info('HTTP client configured with secure headers');
 
-        this.zonesAPI = new ZonesAPI({ apiKey });
-        this.scrapeAPI = new ScrapeAPI({
+        this.transport = new Transport({
             apiKey,
-            zonesAPI: this.zonesAPI,
-            autoCreateZones: opt.autoCreateZones,
-            zone:
-                opt.webUnlockerZone ||
-                BRIGHTDATA_WEB_UNLOCKER_ZONE ||
-                DEFAULT_WEB_UNLOCKER_ZONE,
+            authSource,
+            timeout: opt.timeout,
+            rateLimit: opt.rateLimit,
+            ratePeriod: opt.ratePeriod,
         });
-        this.searchAPI = new SearchAPI({
-            apiKey,
-            zonesAPI: this.zonesAPI,
-            autoCreateZones: opt.autoCreateZones,
-            zone: opt.serpZone || BRIGHTDATA_SERP_ZONE || DEFAULT_SERP_ZONE,
+
+        this.autoCreateZones = opt.autoCreateZones;
+        this.webUnlockerZone =
+            opt.webUnlockerZone ||
+            BRIGHTDATA_WEB_UNLOCKER_ZONE ||
+            DEFAULT_WEB_UNLOCKER_ZONE;
+        this.serpZone =
+            opt.serpZone || BRIGHTDATA_SERP_ZONE || DEFAULT_SERP_ZONE;
+
+        this.zonesAPI = new ZonesAPI({ transport: this.transport });
+
+        defineLazy(this, 'scrape', () =>
+            new ScrapeRouter({ transport: this.transport }),
+        );
+
+        defineLazy(this, 'search', () =>
+            new SearchRouter({
+                transport: this.transport,
+                zonesAPI: this.zonesAPI,
+                autoCreateZones: this.autoCreateZones,
+                zone: this.serpZone,
+            }),
+        );
+
+        defineLazy(this, 'datasets', () =>
+            new DatasetsClient({ transport: this.transport }),
+        );
+
+        defineLazy(this, 'scraperStudio', () =>
+            new ScraperStudioService({ transport: this.transport }),
+        );
+
+        defineLazy(this, 'browser', () => {
+            const username =
+                opt.browserUsername ||
+                process.env.BRIGHTDATA_BROWSERAPI_USERNAME;
+            const password =
+                opt.browserPassword ||
+                process.env.BRIGHTDATA_BROWSERAPI_PASSWORD;
+
+            if (!username || !password) {
+                throw new ValidationError(
+                    'Browser API requires credentials. Pass browserUsername and browserPassword to the client, ' +
+                        'or set BRIGHTDATA_BROWSERAPI_USERNAME and BRIGHTDATA_BROWSERAPI_PASSWORD environment variables.',
+                );
+            }
+
+            return new BrowserService({
+                username,
+                password,
+                host: opt.browserHost,
+                port: opt.browserPort,
+            });
         });
-        this.datasets = new DatasetsRouter({ apiKey });
+
+        defineLazy(this, 'crawler', () => {
+            const snapshotOps = new SnapshotAPI({ transport: this.transport });
+            return new CrawlerService({
+                transport: this.transport,
+                snapshotOps,
+            });
+        });
     }
+
+    private get scrapeAPI(): ScrapeAPI {
+        if (!this._scrapeAPI) {
+            this._scrapeAPI = new ScrapeAPI({
+                transport: this.transport,
+                zonesAPI: this.zonesAPI,
+                autoCreateZones: this.autoCreateZones,
+                zone: this.webUnlockerZone,
+            });
+        }
+        return this._scrapeAPI;
+    }
+
+    private get discoverService(): DiscoverService {
+        if (!this._discoverService) {
+            this._discoverService = new DiscoverService({
+                transport: this.transport,
+            });
+        }
+        return this._discoverService;
+    }
+
     /**
      * Scrape a single URL using Bright Data Web Unlocker API
      *
@@ -126,15 +259,15 @@ export class bdclient {
      * @example
      * ```javascript
      * // Simple scraping (returns HTML)
-     * const html = await client.scrape('https://example.com');
+     * const html = await client.scrapeUrl('https://example.com');
      *
      * // Get structured JSON data
-     * const data = await client.scrape('https://example.com', {
+     * const data = await client.scrapeUrl('https://example.com', {
      *     format: 'json'
      * });
      *
      * // Advanced options
-     * const result = await client.scrape('https://example.com', {
+     * const result = await client.scrapeUrl('https://example.com', {
      *     method: 'GET',                 // 'GET' | 'POST' | 'PUT' | 'DELETE' | 'PATCH'
      *     country: 'us',                 // 'us' | 'gb' | 'de' | 'jp' etc.
      *     format: 'raw',                 // 'raw' | 'json'
@@ -144,25 +277,25 @@ export class bdclient {
      * });
      *
      * // E-commerce scraping
-     * const productData = await client.scrape('https://amazon.com/dp/B123', {
+     * const productData = await client.scrapeUrl('https://amazon.com/dp/B123', {
      *     format: 'json',
      *     country: 'us'
      * });
      * ```
      */
     // prettier-ignore
-    async scrape(url: string, opts?: ScrapeJSONOptions): Promise<SingleJSONResponse>;
+    async scrapeUrl(url: string, opts?: ScrapeJSONOptions): Promise<SingleJSONResponse>;
     // prettier-ignore
-    async scrape(url: string, opts?: ScrapeOptions): Promise<SingleRawResponse>;
+    async scrapeUrl(url: string, opts?: ScrapeOptions): Promise<SingleRawResponse>;
     // prettier-ignore
-    async scrape(url: string[], opts?: ScrapeJSONOptions): Promise<BatchJSONResponse>;
+    async scrapeUrl(url: string[], opts?: ScrapeJSONOptions): Promise<BatchJSONResponse>;
     // prettier-ignore
-    async scrape(url: string[], opts?: ScrapeOptions): Promise<BatchRawResponse>;
-    async scrape(
+    async scrapeUrl(url: string[], opts?: ScrapeOptions): Promise<BatchRawResponse>;
+    async scrapeUrl(
         url: string | string[],
         options: ScrapeOptions | ScrapeJSONOptions = {},
     ): Promise<AnyResponse> {
-        const label = 'bdclient.scrape.';
+        const label = 'bdclient.scrapeUrl.';
         const safeUrl = assertSchema(URLParamSchema, url, `${label}url`);
         const safeOptions = assertSchema(
             ScrapeOptionsSchema,
@@ -180,81 +313,6 @@ export class bdclient {
             : this.scrapeAPI.handle(safeUrl, safeOptions);
     }
     /**
-     * Search using a single query via Bright Data SERP API
-     *
-     * Performs web search on Google, Bing, or Yandex with anti-bot protection bypass
-     *
-     * @example
-     * ```javascript
-     * // Simple Google search
-     * const results = await client.search('pizza restaurants');
-     *
-     * // Structured search results
-     * const data = await client.search('best laptops 2024', {
-     *     format: 'json'
-     * });
-     *
-     * // Advanced search options
-     * const results = await client.search('machine learning courses', {
-     *     searchEngine: 'bing',          // 'google' | 'bing' | 'yandex'
-     *     country: 'us',                 // 'us' | 'gb' | 'de' | 'jp' etc.
-     *     format: 'json',                // 'raw' | 'json'
-     *     dataFormat: 'markdown',        // 'html' | 'markdown' | 'screenshot'
-     *     timeout: 20000,                // 5000-300000 milliseconds
-     *     zone: 'my_serp_zone'           // Custom zone
-     * });
-     *
-     * // Different search engines
-     * const googleResults = await client.search('nodejs tutorial', {
-     *     searchEngine: 'google',
-     *     country: 'us'
-     * });
-     *
-     * const bingResults = await client.search('nodejs tutorial', {
-     *     searchEngine: 'bing',
-     *     country: 'us'
-     * });
-     *
-     * const yandexResults = await client.search('nodejs tutorial', {
-     *     searchEngine: 'yandex',
-     *     country: 'ru'
-     * });
-     * ```
-     */
-    // prettier-ignore
-    async search(query: string, options: SearchJSONOptions): Promise<SingleJSONResponse>;
-    // prettier-ignore
-    async search(query: string, options?: SearchOptions): Promise<SingleRawResponse>;
-    // prettier-ignore
-    async search(query: string[], options: SearchJSONOptions): Promise<BatchJSONResponse>;
-    // prettier-ignore
-    async search(query: string[], options?: SearchOptions): Promise<BatchRawResponse>;
-    async search(
-        query: string | string[],
-        options?: SearchOptions | SearchJSONOptions,
-    ): Promise<AnyResponse> {
-        const label = 'bdclient.search.';
-        const safeQuery = assertSchema(
-            SearchQueryParamSchema,
-            query,
-            `${label}url`,
-        );
-        const safeOptions = assertSchema(
-            SearchOptionsSchema,
-            options || {},
-            `${label}url`,
-        );
-
-        this.logger.info(
-            'starting search operation for ' +
-                `${Array.isArray(safeQuery) ? safeQuery.length : 1} query/queries`,
-        );
-
-        return Array.isArray(safeQuery)
-            ? this.searchAPI.handle(safeQuery, safeOptions)
-            : this.searchAPI.handle(safeQuery, safeOptions);
-    }
-    /**
      * Write content to a local file
      *
      * Saves scraped data or search results to disk in various formats
@@ -262,7 +320,7 @@ export class bdclient {
      * @example
      * ```javascript
      * // Save scraped data as JSON
-     * const data = await client.scrape('https://example.com');
+     * const data = await client.scrapeUrl('https://example.com');
      * const filePath = await client.saveResults(data, {
      *     filename: 'scraped_data.json',
      *     format: 'json',
@@ -273,7 +331,7 @@ export class bdclient {
      * // Creates: brightdata_content_1758705609651.json
      *
      * // Save as plain text
-     * const html = await client.scrape('https://example.com');
+     * const html = await client.scrapeUrl('https://example.com');
      * const txtPath = await client.saveResults(html, {
      *     filename: 'page.txt',
      *     format: 'txt',
@@ -334,5 +392,48 @@ export class bdclient {
      */
     async listZones(): Promise<ZoneInfo[]> {
         return await this.zonesAPI.listZones();
+    }
+
+    /**
+     * Search the web with AI-powered relevance ranking.
+     * Triggers a search, polls until complete, returns results.
+     *
+     * @example
+     * ```javascript
+     * const result = await client.discover('AI trends 2026', {
+     *     intent: 'latest technology developments',
+     *     includeContent: true,
+     * });
+     * for (const item of result.data) {
+     *     console.log(`[${item.relevance_score}] ${item.title}`);
+     * }
+     * ```
+     */
+    async discover(query: string, opts?: DiscoverOptions): Promise<DiscoverResult> {
+        return this.discoverService.search(query, opts);
+    }
+
+    /**
+     * Trigger a discover search and return a job for manual polling.
+     *
+     * @example
+     * ```javascript
+     * const job = await client.discoverTrigger('market research SaaS', {
+     *     intent: 'competitor pricing',
+     * });
+     * await job.wait({ timeout: 60_000 });
+     * const data = await job.fetch();
+     * ```
+     */
+    async discoverTrigger(query: string, opts?: DiscoverOptions): Promise<DiscoverJob> {
+        return this.discoverService.trigger(query, opts);
+    }
+
+    async close(): Promise<void> {
+        await this.transport.close();
+    }
+
+    async [Symbol.asyncDispose](): Promise<void> {
+        await this.close();
     }
 }

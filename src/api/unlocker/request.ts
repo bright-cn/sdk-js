@@ -1,12 +1,11 @@
 import { PromisePool } from '@supercharge/promise-pool';
-import { API_ENDPOINT, DEFAULT_CONCURRENCY } from '../../utils/constants';
-import { getLogger } from '../../utils/logger';
-import { APIError, BRDError } from '../../utils/errors';
-import { request, getDispatcher, assertResponse } from '../../utils/net';
-import { getAuthHeaders } from '../../utils/auth';
-import { dropEmptyKeys, parseJSON } from '../../utils/misc';
-import { ZoneNameSchema } from '../../schemas/shared';
-import type { ZoneType } from '../../types/zones';
+import { API_ENDPOINT, DEFAULT_CONCURRENCY } from '../../utils/constants.js';
+import { getLogger } from '../../utils/logger.js';
+import { BRDError } from '../../utils/errors.js';
+import { Transport, assertResponse } from '../../core/transport.js';
+import { dropEmptyKeys, parseJSON } from '../../utils/misc.js';
+import { ZoneNameSchema } from '../../schemas/shared.js';
+import type { ZoneType } from '../../types/zones.js';
 import type {
     RequestOptions,
     SingleRawResponse,
@@ -16,8 +15,8 @@ import type {
     BatchJSONResponse,
     SingleResponse,
     BatchResponse,
-} from '../../types/request';
-import type { ZonesAPI } from '../zones';
+} from '../../types/request.js';
+import type { ZonesAPI } from '../zones.js';
 
 interface RequestQueryBody {
     url: string;
@@ -29,7 +28,7 @@ interface RequestQueryBody {
 }
 
 export interface RequestAPIOptions {
-    apiKey: string;
+    transport: Transport;
     zonesAPI: ZonesAPI;
     autoCreateZones: boolean;
     zone?: string;
@@ -39,14 +38,14 @@ export class RequestAPI {
     protected name!: string;
     protected zoneType!: ZoneType;
     private logger!: ReturnType<typeof getLogger>;
-    private authHeaders: ReturnType<typeof getAuthHeaders>;
+    private transport: Transport;
     private zone?: string;
     private zonesAPI: ZonesAPI;
     private autoCreateZones: boolean;
 
     constructor(opts: RequestAPIOptions) {
         if (opts.zone) this.zone = opts.zone;
-        this.authHeaders = getAuthHeaders(opts.apiKey);
+        this.transport = opts.transport;
         this.zonesAPI = opts.zonesAPI;
         this.autoCreateZones = opts.autoCreateZones;
     }
@@ -119,23 +118,20 @@ export class RequestAPI {
     ): Promise<SingleResponse> {
         const body = this.getRequestBody(val, zone, opt);
 
-        try {
-            const response = await request(API_ENDPOINT.REQUEST, {
+        const response = await this.transport.request(
+            API_ENDPOINT.REQUEST,
+            {
                 method: 'POST',
                 body: JSON.stringify(body),
-                headers: this.authHeaders,
-                dispatcher: getDispatcher({ timeout: opt.timeout }),
-            });
+                timeout: opt.timeout,
+            },
+        );
 
-            const responseTxt = await assertResponse(response);
-            if (opt.format === 'json') {
-                return parseJSON<SingleJSONResponse>(responseTxt);
-            }
-            return responseTxt;
-        } catch (e: unknown) {
-            if (e instanceof BRDError) throw e;
-            throw new APIError(`operation failed: ${(e as Error).message}`);
+        const responseTxt = await assertResponse(response);
+        if (opt.format === 'json') {
+            return parseJSON<SingleJSONResponse>(responseTxt);
         }
+        return responseTxt;
     }
     // prettier-ignore
     private async handleBatch(inputs: string[], zone: string, opt: RequestJSONOptions): Promise<BatchJSONResponse>;
@@ -152,34 +148,27 @@ export class RequestAPI {
             `processing ${inputs.length} items, concurrency is ${limit}`,
         );
 
-        try {
-            const { results } = await PromisePool.for(inputs)
-                .withConcurrency(limit)
-                .useCorrespondingResults()
-                .process(async (url) => {
-                    try {
-                        return await this.handleSingle(url, zone, opt);
-                    } catch (e: unknown) {
-                        return e as BRDError;
-                    }
-                });
-
-            const res = results.map((v) => {
-                if (v === PromisePool.failed || v === PromisePool.notRun)
-                    return new BRDError('unknown error occurred');
-                return v as Exclude<typeof v, symbol>;
+        const { results } = await PromisePool.for(inputs)
+            .withConcurrency(limit)
+            .useCorrespondingResults()
+            .process(async (url) => {
+                try {
+                    return await this.handleSingle(url, zone, opt);
+                } catch (e: unknown) {
+                    return e as BRDError;
+                }
             });
 
-            this.logger.info(
-                `completed batch operation: ${res.length} results`,
-            );
+        const res = results.map((v) => {
+            if (v === PromisePool.failed || v === PromisePool.notRun)
+                return new BRDError('unknown error occurred');
+            return v as Exclude<typeof v, symbol>;
+        });
 
-            return res;
-        } catch (error: unknown) {
-            const err = error as Error;
-            const msg = `batch operation failed: ${err.message}`;
-            this.logger.error(msg);
-            throw new APIError(msg);
-        }
+        this.logger.info(
+            `completed batch operation: ${res.length} results`,
+        );
+
+        return res;
     }
 }

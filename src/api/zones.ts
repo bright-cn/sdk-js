@@ -1,10 +1,9 @@
-import { getLogger } from '../utils/logger';
-import { API_ENDPOINT } from '../utils/constants';
-import { getAuthHeaders } from '../utils/auth';
-import { parseJSON } from '../utils/misc';
-import { request, assertResponse } from '../utils/net';
-import { ZoneError, APIError, BRDError } from '../utils/errors';
-import type { ZoneInfo, ZoneInfoResponse } from '../types/zones';
+import { getLogger } from '../utils/logger.js';
+import { API_ENDPOINT } from '../utils/constants.js';
+import { parseJSON } from '../utils/misc.js';
+import { Transport, assertResponse } from '../core/transport.js';
+import { ZoneError, BRDError } from '../utils/errors.js';
+import type { ZoneInfo, ZoneInfoResponse } from '../types/zones.js';
 
 const logger = getLogger('api.zones');
 
@@ -31,8 +30,8 @@ interface ZoneCreationOpts {
     custom_headers?: boolean;
 }
 
-interface ZonesAPIOpts {
-    apiKey: string;
+export interface ZonesAPIOpts {
+    transport: Transport;
 }
 
 interface EnsureZoneOpts {
@@ -42,40 +41,34 @@ interface EnsureZoneOpts {
 type ZonesCache = Record<string, ZoneInfo>;
 
 export class ZonesAPI {
-    private authHeaders: Record<string, string>;
+    private transport: Transport;
     private cachedZones: ZonesCache | null = null;
 
     constructor(opts: ZonesAPIOpts) {
-        this.authHeaders = getAuthHeaders(opts.apiKey);
+        this.transport = opts.transport;
     }
 
     async listZones(): Promise<ZoneInfo[]> {
         logger.info('fetching list of active zones');
 
-        try {
-            const response = await request(API_ENDPOINT.ZONE_LIST, {
-                headers: this.authHeaders,
-            });
+        const response = await this.transport.request(
+            API_ENDPOINT.ZONE_LIST,
+            {},
+        );
 
-            const responseTxt = await assertResponse(response);
-            const zones = parseJSON<ZoneInfoResponse[]>(responseTxt);
+        const responseTxt = await assertResponse(response);
+        const zones = parseJSON<ZoneInfoResponse[]>(responseTxt);
 
-            logger.info(`found ${zones.length} active zones`);
+        logger.info(`found ${zones.length} active zones`);
 
-            const res = zones.map((zone) => ({
-                name: zone.zone || zone.name,
-                type: zone.zone_type || zone.type,
-                status: zone.status,
-                ips: zone.ips || 0,
-                bandwidth: zone.bandwidth || 0,
-                created: zone.created_at || zone.created,
-            }));
-
-            return res;
-        } catch (e: unknown) {
-            if (e instanceof BRDError) throw e;
-            throw new APIError(`failed to list zones: ${(e as Error).message}`);
-        }
+        return zones.map((zone) => ({
+            name: zone.zone || zone.name,
+            type: zone.zone_type || zone.type,
+            status: zone.status,
+            ips: zone.ips || 0,
+            bandwidth: zone.bandwidth || 0,
+            created: zone.created_at || zone.created,
+        }));
     }
 
     async ensureZone(name: string, opts: EnsureZoneOpts) {
@@ -140,8 +133,7 @@ export class ZonesAPI {
         };
 
         try {
-            const response = await request(API_ENDPOINT.ZONE, {
-                headers: this.authHeaders,
+            const response = await this.transport.request(API_ENDPOINT.ZONE, {
                 method: 'POST',
                 body: JSON.stringify(zoneData),
             });
